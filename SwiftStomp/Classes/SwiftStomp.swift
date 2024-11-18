@@ -6,60 +6,89 @@
 //  Copyright © 2020 Ahmad Daneshvar. All rights reserved.
 //
 
-import Foundation
-import OSLog
-import Reachability
 import Combine
+import Foundation
+import Network
+import OSLog
 
 let NULL_CHAR = "\u{00}"
 
-
 // MARK: - SwiftStomp
-public class SwiftStomp: NSObject {
 
-    fileprivate var host : URL
-    fileprivate var httpConnectionHeaders : [String : String]?
-    fileprivate var stompConnectionHeaders : [String : String]?
+public class SwiftStomp: NSObject {
+    private enum Constant {
+        // FIXME: добавить описание
+        static let heartbeatSymbol = "\n"
+
+        static let heartbeatKey = StompCommonHeader.heartBeat.rawValue
+
+        /// Интервал по умолчанию для отправки heartbeat на сервер.
+        /// Будет использоваться если с сервера не пришли настройки
+        static let defaultHeartbeatIntervalMilliseconds = 10000
+    }
+
+    fileprivate var host: URL
+    fileprivate var httpConnectionHeaders: [String: String]?
+    fileprivate var stompConnectionHeaders: [String: String]?
 
     fileprivate var urlSession: URLSession?
     fileprivate var webSocketTask: URLSessionWebSocketTask?
 
     fileprivate var acceptVersion = "1.1,1.2"
-    fileprivate var status : StompConnectionStatus = .socketDisconnected
-    fileprivate var reconnectScheduler : Timer?
+    fileprivate var status: StompConnectionStatus = .socketDisconnected
+    fileprivate var reconnectScheduler: Timer?
     fileprivate var reconnectTryCount = 0
-    fileprivate var reachability : Reachability?
+    fileprivate var reachability: Reachability?
     fileprivate var hostIsReachabile = true
 
     /// Auto ping peroperties
-    fileprivate var pingTimer : Timer?
-    fileprivate var pingInterval: TimeInterval = 10 //< 10 Seconds
+    fileprivate var pingTimer: Timer?
+    fileprivate var pingInterval: TimeInterval = 10 // < 10 Seconds
     fileprivate var autoPingEnabled = false
 
     public weak var delegate: SwiftStompDelegate?
-    
+
     /// Streams
     fileprivate var _eventsUpstream = PassthroughSubject<StompUpstreamEvent, Never>()
     fileprivate var _messagesUpstream = PassthroughSubject<StompUpstreamMessage, Never>()
     fileprivate var _receiptsUpstream = PassthroughSubject<String, Never>()
-    
+
+    /// Автоматически по таймеру отправлять heartbeat на сервер
+    private var isAutoHeartbeatEnable = false
+
+    /// Интервал с которым клиент хочет отправлять heartbeat на сервер
+    private var heartbeatClientIntervalSeconds: TimeInterval = 0
+
+    /// Интервал с которым сервер ожидает heartbeat от клиента
+    private var heartbeatServerIntervalSeconds: TimeInterval = 0
+
+    /// Интервал с которым будут отправляться heartbeat до сервера
+    /// Выбирается наибольший из значений клиента и сервера
+    private var heartbeatToServerInterval: TimeInterval {
+        max(heartbeatClientIntervalSeconds, heartbeatServerIntervalSeconds)
+    }
+
+    /// Таймер для автоматической отправки heartbeat
+    private var heartbeatTimer: Timer?
+
     public var eventsUpstream: AnyPublisher<StompUpstreamEvent, Never> {
         _eventsUpstream.eraseToAnyPublisher()
     }
-    
+
     public var messagesUpstream: AnyPublisher<StompUpstreamMessage, Never> {
         _messagesUpstream.eraseToAnyPublisher()
     }
-    
+
     public var receiptUpstream: AnyPublisher<String, Never> {
         _receiptsUpstream.eraseToAnyPublisher()
     }
-    
+
     public var enableLogging = false
-    public var isConnected : Bool {
+    public var isConnected: Bool {
         return self.status == .fullyConnected
     }
-    public var connectionStatus : StompConnectionStatus{
+
+    public var connectionStatus: StompConnectionStatus {
         return self.status
     }
 
@@ -80,12 +109,28 @@ public class SwiftStomp: NSObject {
 
     public var autoReconnect = false
 
-    public init (host : URL, headers : [String : String]? = nil, httpConnectionHeaders : [String : String]? = nil){
+    public init(host: URL, headers: [String: String]? = nil, httpConnectionHeaders: [String: String]? = nil) {
+        // FIXME: код из оргинальной библиотеки
+        //        self.host = host
+        //        self.stompConnectionHeaders = headers
+        //        self.httpConnectionHeaders = httpConnectionHeaders
+        //        super.init()
+        //        self.urlSession = URLSession(configuration: .default, delegate: self, delegateQueue: nil)
+        //        self.initReachability()
         self.host = host
         self.stompConnectionHeaders = headers
         self.httpConnectionHeaders = httpConnectionHeaders
         super.init()
-        self.urlSession = URLSession(configuration: .default, delegate: self, delegateQueue: nil)
+
+        let sessionConfig = URLSessionConfiguration.default
+        // FIXME: Подключение к локальной проксе для Proxyman. удалить или вынести в настройки
+        if #available(iOS 17.0, *) {
+            let sockProxy = NWEndpoint.hostPort(host: "localhost", port: 8889)
+            let proxyConfig = ProxyConfiguration(socksv5Proxy: sockProxy)
+            sessionConfig.proxyConfigurations = [proxyConfig]
+        }
+
+        self.urlSession = URLSession(configuration: sessionConfig, delegate: self, delegateQueue: nil)
         self.initReachability()
     }
 
@@ -93,8 +138,12 @@ public class SwiftStomp: NSObject {
         disconnect(force: true)
     }
 
-    private func initReachability(){
-        if let reachability = try? Reachability(queueQoS: .utility, targetQueue: DispatchQueue(label: "swiftStomp.reachability"), notificationQueue: .global()) {
+    private func initReachability() {
+        if let reachability = try? Reachability(
+            queueQoS: .utility,
+            targetQueue: DispatchQueue(label: "swiftStomp.reachability"),
+            notificationQueue: .global()
+        ) {
             reachability.whenReachable = { [weak self] _ in
                 self?.stompLog(type: .info, message: "Network IS reachable")
                 self?.hostIsReachabile = true
@@ -111,25 +160,24 @@ public class SwiftStomp: NSObject {
 }
 
 /// Public Operating functions
-public extension SwiftStomp{
-    func connect(timeout : TimeInterval = 5, acceptVersion : String = "1.1,1.2", autoReconnect : Bool = false){
-
+extension SwiftStomp {
+    public func connect(timeout: TimeInterval = 5, acceptVersion: String, autoReconnect: Bool = false) {
         self.stompLog(type: .info, message: "Connecting...  autoReconnect: \(autoReconnect)")
 
         self.autoReconnect = autoReconnect
 
-        //** If socket is connected now, just needs to connect to the Stomp
-        if self.status == .socketConnected{
+        // ** If socket is connected now, just needs to connect to the Stomp
+        if self.status == .socketConnected {
             self.stompConnect()
             return
         }
 
         var urlRequest = URLRequest(url: self.host)
 
-        //** Accept Version
+        // ** Accept Version
         self.acceptVersion = acceptVersion
 
-        //** Time interval
+        // ** Time interval
         urlRequest.timeoutInterval = timeout
 
         if let httpConnectionHeaders {
@@ -146,70 +194,75 @@ public extension SwiftStomp{
         self.status = .connecting
     }
 
-    func disconnect(force : Bool = false){
-
+    public func disconnect(force: Bool = false) {
         self.autoReconnect = false
         self.disableAutoPing()
         self.invalidateConnector()
 
-        if !force{ //< Send disconnect first over STOMP
+        if !force { // < Send disconnect first over STOMP
             self.stompDisconnect()
-        } else { //< Disconnect socket directly! (Not recommended until you have to do it!)
+        } else { // < Disconnect socket directly! (Not recommended until you have to do it!)
             handleDisconnect()
         }
     }
 
-    func subscribe(to destination : String, mode : StompAckMode = .auto, headers : [String : String]? = nil){
+    public func subscribe(to destination: String, mode: StompAckMode = .auto, headers: [String: String]? = nil) {
         var headersToSend = StompHeaderBuilder
             .add(key: .destination, value: destination)
             .add(key: .id, value: destination)
             .add(key: .ack, value: mode.rawValue)
             .get
 
-        //** Append extra headers
-        headers?.forEach({ hEntry in
+        // ** Append extra headers
+        headers?.forEach { hEntry in
             headersToSend[hEntry.key] = hEntry.value
-        })
+        }
 
         self.sendFrame(frame: StompFrame(name: .subscribe, headers: headersToSend))
     }
 
-    func unsubscribe(from destination : String, mode : StompAckMode = .auto, headers : [String : String]? = nil){
+    public func unsubscribe(from destination: String, mode _: StompAckMode = .auto, headers: [String: String]? = nil) {
         var headersToSend = StompHeaderBuilder
             .add(key: .id, value: destination)
             .get
 
-        //** Append extra headers
-        headers?.forEach({ hEntry in
+        // ** Append extra headers
+        headers?.forEach { hEntry in
             headersToSend[hEntry.key] = hEntry.value
-        })
+        }
 
         self.sendFrame(frame: StompFrame(name: .unsubscribe, headers: headersToSend))
     }
 
-    func send(body : String, to : String, receiptId : String? = nil, headers : [String : String]? = nil){
+    public func send(body: String, to: String, receiptId: String? = nil, headers: [String: String]? = nil) {
         let headers = prepareHeadersForSend(to: to, receiptId: receiptId, headers: headers)
 
         self.sendFrame(frame: StompFrame(name: .send, headers: headers, stringBody: body))
     }
 
-    func send(body : Data, to : String, receiptId : String? = nil, headers : [String : String]? = nil){
+    public func send(body: Data, to: String, receiptId: String? = nil, headers: [String: String]? = nil) {
         let headers = prepareHeadersForSend(to: to, receiptId: receiptId, headers: headers)
 
         self.sendFrame(frame: StompFrame(name: .send, headers: headers, dataBody: body))
     }
 
-    func send <T : Encodable> (body : T, to : String, receiptId : String? = nil, headers : [String : String]? = nil, jsonDateEncodingStrategy : JSONEncoder.DateEncodingStrategy = .iso8601){
+    public func send<T: Encodable>(body: T, to: String, receiptId: String? = nil, headers: [String: String]? = nil,
+                                   jsonDateEncodingStrategy: JSONEncoder.DateEncodingStrategy = .iso8601) {
         let headers = prepareHeadersForSend(to: to, receiptId: receiptId, headers: headers)
 
-        self.sendFrame(frame: StompFrame(name: .send, headers: headers, encodableBody: body, jsonDateEncodingStrategy: jsonDateEncodingStrategy))
+        self.sendFrame(frame: StompFrame(
+            name: .send,
+            headers: headers,
+            encodableBody: body,
+            jsonDateEncodingStrategy: jsonDateEncodingStrategy
+        ))
     }
 
-    func ack(messageId : String, transaction : String? = nil){
+    public func ack(messageId: String, transaction: String? = nil) {
         let headerBuilder = StompHeaderBuilder
             .add(key: .id, value: messageId)
 
-        if let transaction = transaction{
+        if let transaction = transaction {
             _ = headerBuilder.add(key: .transaction, value: transaction)
         }
 
@@ -218,11 +271,11 @@ public extension SwiftStomp{
         self.sendFrame(frame: StompFrame(name: .ack, headers: headers))
     }
 
-    func nack(messageId : String, transaction : String? = nil){
+    public func nack(messageId: String, transaction: String? = nil) {
         let headerBuilder = StompHeaderBuilder
             .add(key: .id, value: messageId)
 
-        if let transaction = transaction{
+        if let transaction = transaction {
             _ = headerBuilder.add(key: .transaction, value: transaction)
         }
 
@@ -231,7 +284,7 @@ public extension SwiftStomp{
         self.sendFrame(frame: StompFrame(name: .nack, headers: headers))
     }
 
-    func begin(transactionName : String){
+    public func begin(transactionName: String) {
         let headers = StompHeaderBuilder
             .add(key: .transaction, value: transactionName)
             .get
@@ -239,7 +292,7 @@ public extension SwiftStomp{
         self.sendFrame(frame: StompFrame(name: .begin, headers: headers))
     }
 
-    func commit(transactionName : String){
+    public func commit(transactionName: String) {
         let headers = StompHeaderBuilder
             .add(key: .transaction, value: transactionName)
             .get
@@ -247,7 +300,7 @@ public extension SwiftStomp{
         self.sendFrame(frame: StompFrame(name: .commit, headers: headers))
     }
 
-    func abort(transactionName : String){
+    public func abort(transactionName: String) {
         let headers = StompHeaderBuilder
             .add(key: .transaction, value: transactionName)
             .get
@@ -255,54 +308,60 @@ public extension SwiftStomp{
         self.sendFrame(frame: StompFrame(name: .abort, headers: headers))
     }
 
-
     /// Send ping command to keep connection alive
     /// - Parameters:
     ///   - data: Date to send over Web socket
     ///   - completion: Completion block
-    func ping(data: Data = Data(), completion: (() -> Void)? = nil) {
-
-        //** Check socket status
+    public func ping(data _: Data = Data(), completion: (() -> Void)? = nil) {
+        // ** Check socket status
         guard let webSocketTask, self.status == .fullyConnected || self.status == .socketConnected else {
             self.stompLog(type: .info, message: "Stomp: Unable to send `ping`. Socket is not connected!")
             return
         }
 
-        webSocketTask.sendPing() { _ in
+        webSocketTask.sendPing { _ in
             completion?()
         }
 
         self.stompLog(type: .info, message: "Stomp: Ping sent!")
 
-        //** Reset ping timer
+        // ** Reset ping timer
         self.resetPingTimer()
     }
-
 
     /// Enable auto ping command to ensure connection will keep alive and prevent connection to stay idle
     /// - Notice: Please be care if you used `disconnect`, you have to re-enable the timer again.
     /// - Parameter pingInterval: Ping command send interval
-    func enableAutoPing(pingInterval: TimeInterval = 10){
+    public func enableAutoPing(pingInterval: TimeInterval = 10) {
         self.pingInterval = pingInterval
         self.autoPingEnabled = true
 
-        //** Reset ping timer
+        // ** Reset ping timer
         self.resetPingTimer()
     }
 
-
     /// Disable auto ping function
-    func disableAutoPing(){
+    public func disableAutoPing() {
         self.autoPingEnabled = false
         self.pingTimer?.invalidate()
     }
 
+    /// Автоматически отправлять heartbeat на сервер. Интервал будет выбран...
+    // FIXME: дописать выше
+    /// - Parameter isEnable: включена автоматическая отправка
+    public func setEnableAutoHeartbeat(_ isEnable: Bool) {
+        stompLog(type: .info, message: "Автоматическая отправка Heartbeat установлена в: \(isEnable)")
+        isAutoHeartbeatEnable = isEnable
+        resetHeartbeatTimer()
+    }
 }
 
 /// Helper functions
-fileprivate extension SwiftStomp{
-    func stompLog(type : StompLogType, message : String){
-        guard enableLogging else { return }
+extension SwiftStomp {
+    private func stompLog(type: StompLogType, message: String) {
+        guard enableLogging else {
+            return
+        }
 
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
@@ -311,20 +370,19 @@ fileprivate extension SwiftStomp{
         os_log(type == .info ? .info : .error, "%s SwiftStomp [%s]: %s", timestamp, type.rawValue, message)
     }
 
-    func prepareHeadersForSend(to : String, receiptId : String? = nil, headers : [String : String]? = nil) -> [String : String]{
-
+    private func prepareHeadersForSend(to: String, receiptId: String? = nil, headers: [String: String]? = nil) -> [String: String] {
         let headerBuilder = StompHeaderBuilder
-        .add(key: .destination, value: to)
+            .add(key: .destination, value: to)
 
-        if let receiptId = receiptId{
+        if let receiptId = receiptId {
             _ = headerBuilder.add(key: .receipt, value: receiptId)
         }
 
         var headersToSend = headerBuilder.get
 
-        //** Append user headers
-        if let headers = headers{
-            for (hKey, hVal) in headers{
+        // ** Append user headers
+        if let headers = headers {
+            for (hKey, hVal) in headers {
                 headersToSend[hKey] = hVal
             }
         }
@@ -332,10 +390,10 @@ fileprivate extension SwiftStomp{
         return headersToSend
     }
 
-    func scheduleConnector(){
+    private func scheduleConnector() {
         self.stompLog(type: .info, message: "Scheduling connector")
 
-        if let scheduler = self.reconnectScheduler, scheduler.isValid{
+        if let scheduler = self.reconnectScheduler, scheduler.isValid {
             scheduler.invalidate()
             reconnectScheduler = nil
         }
@@ -343,58 +401,57 @@ fileprivate extension SwiftStomp{
         try? self.reachability?.startNotifier()
 
         DispatchQueue.main.async { [weak self] in
-            self?.reconnectScheduler = Timer.scheduledTimer(withTimeInterval: 3, repeats: true){ [weak self] timer in
+            self?.reconnectScheduler = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
                 guard let self = self else {
                     return
                 }
 
                 self.stompLog(type: .info, message: "Reconnect scheduler running")
 
-                if !self.hostIsReachabile{
+                if !self.hostIsReachabile {
                     self.stompLog(type: .info, message: "Network is not reachable. Ignore connecting!")
                     return
                 }
 
-                self.connect(autoReconnect: self.autoReconnect)
+                self.connect(acceptVersion: self.acceptVersion, autoReconnect: self.autoReconnect)
             }
         }
     }
 
-    func invalidateConnector(){
+    private func invalidateConnector() {
         self.stompLog(type: .info, message: "Invalidating connector")
 
-        if let connector = self.reconnectScheduler, connector.isValid{
+        if let connector = self.reconnectScheduler, connector.isValid {
             connector.invalidate()
         }
 
         self.reachability?.stopNotifier()
     }
-
 }
 
 /// Back-Operating functions
-fileprivate extension SwiftStomp{
-    func stompConnect(){
-
-        //** Add headers
+extension SwiftStomp {
+    private func stompConnect() {
+        // ** Add headers
         var headers = StompHeaderBuilder
             .add(key: .acceptVersion, value: self.acceptVersion)
             .get
 
-        //** Append connection headers
-        if let stompConnectionHeaders = self.stompConnectionHeaders{
-            for (hKey, hVal) in stompConnectionHeaders{
+        // ** Append connection headers
+        if let stompConnectionHeaders = self.stompConnectionHeaders {
+            for (hKey, hVal) in stompConnectionHeaders {
                 headers[hKey] = hVal
             }
         }
 
-
+        // FIXME: Подумать где еще их можно сохранять
+        saveHeartbeatClientSettings(connectedHeaders: stompConnectionHeaders ?? [:])
 
         self.sendFrame(frame: StompFrame(name: .connect, headers: headers))
     }
 
-    func stompDisconnect(){
-        //** Add headers
+    private func stompDisconnect() {
+        // ** Add headers
         let headers = StompHeaderBuilder
             .add(key: .receipt, value: "disconnect/safe")
             .get
@@ -402,20 +459,24 @@ fileprivate extension SwiftStomp{
         self.sendFrame(frame: StompFrame(name: .disconnect, headers: headers))
     }
 
-    func processReceivedSocketText(text : String){
-        var frame : StompFrame<StompResponseFrame>
+    private func processReceivedSocketText(text: String) {
+        var frame: StompFrame<StompResponseFrame>
 
-        //** Deserialize frame
-        do{
+        // ** Deserialize frame
+        do {
             frame = try StompFrame(withSerializedString: text)
-        }catch {
+        } catch {
             stompLog(type: .stompError, message: "Process frame error: \(error.localizedDescription)")
             return
         }
 
-        //** Dispatch STOMP frame
+        // ** Dispatch STOMP frame
 
         switch frame.name {
+        case .serverPing:
+            // Тут можно реагировать на пинги сервера
+            stompLog(type: .info, message: "Stomp: Server Ping")
+
         case .message:
             stompLog(type: .info, message: "Stomp: Message received: \(String(describing: frame.body))")
 
@@ -423,9 +484,17 @@ fileprivate extension SwiftStomp{
             let destination = frame.getCommonHeader(.destination) ?? ""
 
             callbacksThread.async { [weak self] in
-                guard let self else { return }
-                self.delegate?.onMessageReceived(swiftStomp: self, message: frame.body, messageId: messageId, destination: destination, headers: frame.headers)
-                
+                guard let self else {
+                    return
+                }
+                self.delegate?.onMessageReceived(
+                    swiftStomp: self,
+                    message: frame.body,
+                    messageId: messageId,
+                    destination: destination,
+                    headers: frame.headers
+                )
+
                 // ** Broadcast through upstream
                 if let stringBody = frame.body as? String {
                     self._messagesUpstream.send(
@@ -454,20 +523,23 @@ fileprivate extension SwiftStomp{
                 return
             }
 
-
             stompLog(type: .info, message: "Receipt received: \(receiptId)")
 
             callbacksThread.async { [weak self] in
-                guard let self else { return }
+                guard let self else {
+                    return
+                }
                 self.delegate?.onReceipt(swiftStomp: self, receiptId: receiptId)
                 self._receiptsUpstream.send(receiptId)
             }
 
-            if receiptId == "disconnect/safe"{
+            if receiptId == "disconnect/safe" {
                 self.status = .socketConnected
 
                 callbacksThread.async { [weak self] in
-                    guard let self else { return }
+                    guard let self else {
+                        return
+                    }
                     self.delegate?.onDisconnect(swiftStomp: self, disconnectType: .fromStomp)
                     self._eventsUpstream.send(.disconnected(type: .fromStomp))
                 }
@@ -490,27 +562,44 @@ fileprivate extension SwiftStomp{
             stompLog(type: .stompError, message: briefDescription)
 
             callbacksThread.async { [weak self] in
-                guard let self else { return }
-                self.delegate?.onError(swiftStomp: self, briefDescription: briefDescription, fullDescription: fullDescription, receiptId: receiptId, type: .fromStomp)
-                self._eventsUpstream.send(.error(error: .init(type: .fromStomp, receiptId: receiptId, localizedDescription: briefDescription)))
+                guard let self else {
+                    return
+                }
+                self.delegate?.onError(
+                    swiftStomp: self,
+                    briefDescription: briefDescription,
+                    fullDescription: fullDescription,
+                    receiptId: receiptId,
+                    type: .fromStomp
+                )
+                self._eventsUpstream.send(.error(error: .init(
+                    type: .fromStomp,
+                    receiptId: receiptId,
+                    localizedDescription: briefDescription
+                )))
             }
 
         case .connected:
             self.status = .fullyConnected
+            self.saveHeartbeatServerSettings(connectedHeaders: frame.headers)
+            self.resetHeartbeatTimer()
 
             stompLog(type: .info, message: "Stomp: Connected")
 
             callbacksThread.async { [weak self] in
-                guard let self else { return }
+                guard let self else {
+                    return
+                }
                 self.delegate?.onConnect(swiftStomp: self, connectType: .toStomp)
                 self._eventsUpstream.send(.connected(type: .toStomp))
             }
+
         default:
             stompLog(type: .info, message: "Stomp: Un-Processable content: \(text)")
         }
     }
 
-    func sendFrame(frame : StompFrame<StompRequestFrame>, completion : (() -> ())? = nil){
+    private func sendFrame(frame: StompFrame<StompRequestFrame>, completion: (() -> Void)? = nil) {
         guard let webSocketTask else {
             stompLog(type: .info, message: "Unable to send frame \(frame.name.rawValue): WebSocket is not connected!")
             return
@@ -518,7 +607,7 @@ fileprivate extension SwiftStomp{
 
         switch self.status {
         case .socketConnected:
-            if frame.name != .connect{
+            if frame.name != .connect {
                 stompLog(type: .info, message: "Unable to send frame \(frame.name.rawValue): Stomp is not connected!")
                 return
             }
@@ -541,28 +630,102 @@ fileprivate extension SwiftStomp{
             completion?()
         }
 
-        //** Reset ping timer
+        // ** Reset ping timer
         self.resetPingTimer()
     }
 
-    func resetPingTimer(){
-        if !autoPingEnabled{
+    private func resetPingTimer() {
+        if !autoPingEnabled {
             return
         }
 
         DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
+            guard let self else {
+                return
+            }
 
-            //** Invalidate if timer is valid
-            if let t = self.pingTimer, t.isValid{
+            // ** Invalidate if timer is valid
+            if let t = self.pingTimer, t.isValid {
                 t.invalidate()
             }
 
-            //** Schedule the ping timer
+            // ** Schedule the ping timer
             self.pingTimer = Timer.scheduledTimer(withTimeInterval: self.pingInterval, repeats: true) { [weak self] _ in
                 self?.ping()
             }
         }
+    }
+
+    private func resetHeartbeatTimer() {
+        guard isAutoHeartbeatEnable else {
+            stompLog(type: .info, message: "Таймер Heartbeat не перезапущен потому что isAutoHeartbeatEnable != false")
+            return
+        }
+
+        guard status == .fullyConnected else {
+            stompLog(type: .info, message: "Таймер Heartbeat не перезапущен потому что status != .fullyConnected")
+            return
+        }
+
+        DispatchQueue.main.async { [weak self] in
+            guard let self else {
+                return
+            }
+
+            if let heartbeatTimer = self.heartbeatTimer, heartbeatTimer.isValid {
+                heartbeatTimer.invalidate()
+            }
+
+            stompLog(type: .info, message: "Таймер Heartbeat запущен")
+            self.heartbeatTimer = Timer.scheduledTimer(
+                withTimeInterval: self.heartbeatToServerInterval,
+                repeats: true
+            ) { [weak self] _ in
+                self?.sendHeartbeat()
+            }
+        }
+    }
+
+    /// Отправить Heartbeat на сервер
+    private func sendHeartbeat() {
+        stompLog(type: .info, message: "Отпрвален Heartbeat на сервер")
+        webSocketTask?.send(.string(Constant.heartbeatSymbol)) { error in
+            if let error = error {
+                self.stompLog(type: .stompError, message: "Error sending frame: \(error)")
+            }
+        }
+    }
+
+    private func saveHeartbeatServerSettings(connectedHeaders: [String: String]) {
+        guard let heartbeatValues = connectedHeaders[Constant.heartbeatKey],
+              let heartbeatValueMillisecondsString = heartbeatValues.split(separator: .comma).last,
+              let heartbeatValueMilliseconds = Int(heartbeatValueMillisecondsString) else {
+            heartbeatServerIntervalSeconds = TimeInterval(Constant.defaultHeartbeatIntervalMilliseconds / 1000)
+            stompLog(
+                type: .info,
+                message: "Значение heartbeatServerIntervalSeconds установленно по умолчанию: \(Constant.defaultHeartbeatIntervalMilliseconds) ms"
+            )
+            return
+        }
+
+        heartbeatServerIntervalSeconds = TimeInterval(heartbeatValueMilliseconds / 1000)
+        stompLog(type: .info, message: "Установлено новое значение heartbeatServerIntervalSeconds: \(heartbeatValueMilliseconds) ms")
+    }
+
+    private func saveHeartbeatClientSettings(connectedHeaders: [String: String]) {
+        guard let heartbeatValues = connectedHeaders[Constant.heartbeatKey],
+              let heartbeatValueMillisecondsString = heartbeatValues.split(separator: .comma).first,
+              let heartbeatValueMilliseconds = Int(heartbeatValueMillisecondsString) else {
+            heartbeatClientIntervalSeconds = TimeInterval(Constant.defaultHeartbeatIntervalMilliseconds / 1000)
+            stompLog(
+                type: .info,
+                message: "Значение heartbeatClientIntervalSeconds установленно по умолчанию: \(Constant.defaultHeartbeatIntervalMilliseconds) ms"
+            )
+            return
+        }
+
+        heartbeatClientIntervalSeconds = TimeInterval(heartbeatValueMilliseconds / 1000)
+        stompLog(type: .info, message: "Установлено новое значение heartbeatClientIntervalSeconds: \(heartbeatValueMilliseconds) ms")
     }
 }
 
@@ -574,25 +737,33 @@ extension SwiftStomp {
             switch result {
             case .failure(let error):
                 self?.stompLog(type: .socketError, message: "Socket listen: Error: \(error)")
-                
+
                 self?.callbacksThread.async { [weak self] in
-                    guard let self else { return }
-                    self.delegate?.onError(swiftStomp: self, briefDescription: "Stomp Error", fullDescription: error.localizedDescription, receiptId: nil, type: .fromStomp)
+                    guard let self else {
+                        return
+                    }
+                    self.delegate?.onError(
+                        swiftStomp: self,
+                        briefDescription: "Stomp Error",
+                        fullDescription: error.localizedDescription,
+                        receiptId: nil,
+                        type: .fromStomp
+                    )
                 }
-                
+
             case .success(let message):
                 switch message {
                 case .string(let text):
                     self?.stompLog(type: .info, message: "Socket: Received text")
                     self?.processReceivedSocketText(text: text)
-                    
+
                 case .data(let data):
                     self?.stompLog(type: .info, message: "Socket: Received data: \(data.count)")
-                    
+
                 default:
                     break
                 }
-                
+
                 // Keep listening
                 self?.listen()
             }
@@ -600,9 +771,10 @@ extension SwiftStomp {
     }
 }
 
-extension SwiftStomp: URLSessionWebSocketDelegate {
+// MARK: - URLSessionWebSocketDelegate
 
-    public func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask, didOpenWithProtocol protocol: String?) {
+extension SwiftStomp: URLSessionWebSocketDelegate {
+    public func urlSession(_: URLSession, webSocketTask _: URLSessionWebSocketTask, didOpenWithProtocol protocol: String?) {
         let p = `protocol` ?? ""
 
         self.status = .socketConnected
@@ -611,7 +783,9 @@ extension SwiftStomp: URLSessionWebSocketDelegate {
         stompLog(type: .info, message: "Socket: connected, protocol: \(p)")
 
         callbacksThread.async { [weak self] in
-            guard let self else { return }
+            guard let self else {
+                return
+            }
             self.delegate?.onConnect(swiftStomp: self, connectType: .toSocketEndpoint)
             self._eventsUpstream.send(.connected(type: .toSocketEndpoint))
         }
@@ -619,7 +793,8 @@ extension SwiftStomp: URLSessionWebSocketDelegate {
         self.stompConnect()
     }
 
-    public func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask, didCloseWith closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?) {
+    public func urlSession(_: URLSession, webSocketTask _: URLSessionWebSocketTask,
+                           didCloseWith closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?) {
         var r = ""
         if let d = reason {
             r = String(data: d, encoding: .utf8) ?? ""
@@ -630,18 +805,26 @@ extension SwiftStomp: URLSessionWebSocketDelegate {
         handleDisconnect()
     }
 
-    public func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+    public func urlSession(_: URLSession, task _: URLSessionTask, didCompleteWithError error: Error?) {
         guard let error else {
             return
         }
-        
+
         stompLog(type: .socketError, message: "Socket: Error: \(error.localizedDescription)")
 
         handleDisconnect()
 
         callbacksThread.async { [weak self] in
-            guard let self else { return }
-            self.delegate?.onError(swiftStomp: self, briefDescription: "Socket Error", fullDescription: error.localizedDescription, receiptId: nil, type: .fromSocket)
+            guard let self else {
+                return
+            }
+            self.delegate?.onError(
+                swiftStomp: self,
+                briefDescription: "Socket Error",
+                fullDescription: error.localizedDescription,
+                receiptId: nil,
+                type: .fromSocket
+            )
             self._eventsUpstream.send(.error(error: .init(error: error, type: .fromSocket)))
         }
     }
@@ -656,27 +839,29 @@ extension SwiftStomp: URLSessionWebSocketDelegate {
         self.status = .socketDisconnected
 
         callbacksThread.async { [weak self] in
-            guard let self else { return }
+            guard let self else {
+                return
+            }
             self.delegate?.onDisconnect(swiftStomp: self, disconnectType: .fromSocket)
             self._eventsUpstream.send(.disconnected(type: .fromSocket))
         }
 
-        if self.autoReconnect{
+        if self.autoReconnect {
             self.scheduleConnector()
         }
     }
 }
 
 // MARK: - SwiftStomp delegate
-public protocol SwiftStompDelegate: AnyObject{
 
-    func onConnect(swiftStomp : SwiftStomp, connectType : StompConnectType)
+public protocol SwiftStompDelegate: AnyObject {
+    func onConnect(swiftStomp: SwiftStomp, connectType: StompConnectType)
 
-    func onDisconnect(swiftStomp : SwiftStomp, disconnectType : StompDisconnectType)
+    func onDisconnect(swiftStomp: SwiftStomp, disconnectType: StompDisconnectType)
 
-    func onMessageReceived(swiftStomp : SwiftStomp, message : Any?, messageId : String, destination : String, headers : [String : String])
+    func onMessageReceived(swiftStomp: SwiftStomp, message: Any?, messageId: String, destination: String, headers: [String: String])
 
-    func onReceipt(swiftStomp : SwiftStomp, receiptId : String)
+    func onReceipt(swiftStomp: SwiftStomp, receiptId: String)
 
-    func onError(swiftStomp : SwiftStomp, briefDescription : String, fullDescription : String?, receiptId : String?, type : StompErrorType)
+    func onError(swiftStomp: SwiftStomp, briefDescription: String, fullDescription: String?, receiptId: String?, type: StompErrorType)
 }
